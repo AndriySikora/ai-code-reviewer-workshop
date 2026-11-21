@@ -72,11 +72,20 @@ const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 /** Paths like docs/specs/foo.md mentioned in the PR body (plain, in backticks, or as a /blob/<ref>/ URL). */
 export function extractLinkedDocs(body: string): string[] {
-  // TODO(step 2): return up to MAX_LINKED_DOCS unique repo paths ending in .md that contain a '/'.
-  //   - a URL like https://github.com/o/r/blob/main/docs/x.md → 'docs/x.md'; any other URL is ignored
-  //   - strip a leading './'; ignore node_modules/ and ../ ; keep order of appearance
-  void body;
-  return [];
+  const out: string[] = [];
+  for (const [token] of body.matchAll(/https?:\/\/[^\s)`'"<>]+|[\w./-]+\.md\b/g)) {
+    let path = token;
+    if (/^https?:/.test(token)) {
+      const blob = /\/blob\/[^/]+\/([^\s?#]+\.md)(?:[?#]|$)/.exec(token);
+      if (!blob) continue;
+      path = blob[1];
+    }
+    path = path.replace(/^\.\//, '');
+    if (!path.endsWith('.md') || !path.includes('/') || path.includes('../') || path.includes('node_modules/')) continue;
+    if (!out.includes(path)) out.push(path);
+    if (out.length === MAX_LINKED_DOCS) break;
+  }
+  return out;
 }
 
 /**
@@ -84,12 +93,30 @@ export function extractLinkedDocs(body: string): string[] {
  * (New files are skipped: the diff already contains them in full, and nobody else calls them yet.)
  */
 export function extractSymbols(rawDiff: string): string[] {
-  // TODO(step 2): scan the diff of NON-new files that do not match DATA_PATH. Take names from
-  //   - added lines (+): `function name`, `const name = (…) =>`, `const name = async x =>`, `class name`, `def name`
-  //   - the text after the second @@ of a hunk header (the enclosing function)
-  //   Keep names of 4+ characters, unique, at most MAX_SYMBOLS, never a word in STOP_SYMBOLS.
-  void rawDiff;
-  return [];
+  const NAME_PATTERNS = [
+    /\bfunction\s*\*?\s*([A-Za-z_$][\w$]*)/g,
+    /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>/g,
+    /\bclass\s+([A-Za-z_$][\w$]*)/g,
+    /\bdef\s+([A-Za-z_]\w*)/g,
+  ];
+  const out: string[] = [];
+  const add = (text: string) => {
+    for (const re of NAME_PATTERNS) {
+      for (const [, name] of text.matchAll(re)) {
+        if (out.length < MAX_SYMBOLS && name.length >= 4 && !STOP_SYMBOLS.has(name) && !out.includes(name)) out.push(name);
+      }
+    }
+  };
+  let skip = true;
+  for (const line of rawDiff.split('\n')) {
+    const head = /^diff --git a\/.+ b\/(.+)$/.exec(line);
+    if (head) skip = DATA_PATH.test(head[1]);
+    else if (line.startsWith('new file mode')) skip = true;
+    else if (skip) continue;
+    else if (line.startsWith('@@')) add(/^@@[^@]*@@(.*)$/.exec(line)?.[1] ?? '');
+    else if (line.startsWith('+') && !line.startsWith('+++')) add(line.slice(1));
+  }
+  return out;
 }
 
 export interface Hit {
@@ -101,12 +128,21 @@ export interface Hit {
 
 /** Simple grep: lines that mention a symbol as a whole word. Capped overall and per symbol. */
 export function findCallers(symbols: string[], files: { path: string; text: string }[], maxHits = MAX_CALLER_HITS): Hit[] {
-  // TODO(step 2): for every line of every file, one Hit per (line, symbol) where the symbol appears as a whole word
-  //   (not inside a longer identifier). At most `maxHits` hits overall and 5 per symbol. text = trimmed line, max 160 chars.
-  void symbols;
-  void files;
-  void maxHits;
-  return [];
+  const patterns = symbols.map((symbol) => ({ symbol, re: new RegExp(`(?<![\\w$])${escapeRe(symbol)}(?![\\w$])`) }));
+  const perSymbol = new Map<string, number>();
+  const hits: Hit[] = [];
+  for (const file of files) {
+    const lines = file.text.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      for (const { symbol, re } of patterns) {
+        if ((perSymbol.get(symbol) ?? 0) >= 5 || !re.test(lines[i])) continue;
+        perSymbol.set(symbol, (perSymbol.get(symbol) ?? 0) + 1);
+        hits.push({ symbol, path: file.path, line: i + 1, text: lines[i].trim().slice(0, 160) });
+        if (hits.length >= maxHits) return hits;
+      }
+    }
+  }
+  return hits;
 }
 
 const n = (x: number) => x.toLocaleString('en-US');
@@ -116,13 +152,30 @@ const n = (x: number) => x.toLocaleString('en-US');
  * A candidate is cut to its own cap, then to what is left; too little room → skipped.
  */
 export function assembleContext(candidates: Candidate[], budget = DEFAULT_BUDGET): Context {
-  // TODO(step 2): sort by PRIORITY, then for every non-empty candidate:
-  //   room = min(maxChars, budget - used); room < MIN_USEFUL → log "✗ … skipped (budget exhausted)"
-  //   text longer than room → cut it so that text + TRUNCATED fits in `room`
-  //   block = `### ${HEADING[kind]}: ${label}\n${wrapUntrusted(`${kind}:${label}`, text)}`
-  //   log one line per candidate (✓ included, ~ truncated, ✗ skipped) and a final "context: …" summary line.
-  void candidates;
-  return { blocks: [], log: ['  context: not implemented yet (step 2)'], chars: 0, budget };
+  const sorted = [...candidates].sort((a, b) => PRIORITY.indexOf(a.kind) - PRIORITY.indexOf(b.kind));
+  const blocks: string[] = [];
+  const log: string[] = [];
+  let used = 0;
+  for (const c of sorted) {
+    if (!c.text) continue;
+    const name = `${c.kind.padEnd(7)} ${c.label}`;
+    const room = Math.min(c.maxChars ?? Infinity, budget - used);
+    if (room < MIN_USEFUL) {
+      log.push(`  ✗ ${name} skipped (budget exhausted)`);
+      continue;
+    }
+    let text = c.text;
+    if (text.length > room) {
+      text = text.slice(0, room - TRUNCATED.length) + TRUNCATED;
+      log.push(`  ~ ${name} ${n(text.length)} chars (cut from ${n(c.text.length)})`);
+    } else {
+      log.push(`  ✓ ${name} ${n(text.length)} chars`);
+    }
+    used += text.length;
+    blocks.push(`### ${HEADING[c.kind]}: ${c.label}\n${wrapUntrusted(`${c.kind}:${c.label}`, text)}`);
+  }
+  log.push(`  context: ${blocks.length} block(s), ${n(used)} / ${n(budget)} chars (~${n(Math.ceil(used / 4))} tokens)`);
+  return { blocks, log, chars: used, budget };
 }
 
 async function mapLimit<T, R>(items: T[], limit: number, fn: (x: T) => Promise<R>): Promise<R[]> {
@@ -159,17 +212,49 @@ export async function gatherContext(source: RepoSource, opts: GatherOptions): Pr
   const budget = opts.budget ?? (Number(process.env.CONTEXT_BUDGET) || DEFAULT_BUDGET);
   const changed = changedFiles(opts.rawDiff);
   const candidates: Candidate[] = [];
-  // TODO(step 2): collect candidates, then `return assembleContext(candidates, budget)`.
-  //   (a) rules   : every RULES_FILES entry that source.read() returns  → { kind: 'rules', maxChars: r.max }
-  //   (b) specs   : extractLinkedDocs(prBody) + changed docs/**/*.md + opts.extraDocs (max MAX_LINKED_DOCS + 2),
-  //                 { kind: 'spec', maxChars: MAX_DOC_CHARS }
-  //   (c) files   : MODIFIED (not new, not deleted) files that match CODE_EXT and neither NOT_REVIEWABLE nor DATA_PATH,
-  //                 head version via source.read(), { kind: 'file', maxChars: MAX_FILE_CHARS }, smallest file first
-  //   (d) callers : extractSymbols(rawDiff) → read up to source.scanLimit code files from source.list()
-  //                 that are NOT in the diff → findCallers() → one { kind: 'callers', maxChars: 4_000 } block
-  //   Use mapLimit() for parallel reads.
-  void changed;
-  void candidates;
-  void source;
-  return { blocks: [], log: ['  context: not implemented yet (step 2)'], chars: 0, budget };
+
+  // (a) project rules
+  const rules = await mapLimit(RULES_FILES, 4, async (r) => ({ ...r, text: await source.read(r.path) }));
+  for (const r of rules) if (r.text) candidates.push({ kind: 'rules', label: r.path, text: r.text, maxChars: r.max });
+
+  // (b) specs: linked from the PR body, touched by the diff, or requested by the agent
+  const changedDocs = changed.filter((f) => !f.isDeleted && /^docs\/.+\.md$/.test(f.path)).map((f) => f.path);
+  const docPaths = [...new Set([...extractLinkedDocs(opts.prBody ?? ''), ...changedDocs, ...(opts.extraDocs ?? [])])].slice(
+    0,
+    MAX_LINKED_DOCS + 2,
+  );
+  const docs = await mapLimit(docPaths, 4, async (path) => ({ path, text: await source.read(path) }));
+  for (const d of docs) if (d.text) candidates.push({ kind: 'spec', label: d.path, text: d.text, maxChars: MAX_DOC_CHARS });
+
+  // (c) full head version of modified code files, smallest first
+  const modified = changed.filter(
+    (f) => !f.isNew && !f.isDeleted && CODE_EXT.test(f.path) && !NOT_REVIEWABLE.test(f.path) && !DATA_PATH.test(f.path),
+  );
+  const files = await mapLimit(modified, 4, async (f) => ({ path: f.path, text: await source.read(f.path) }));
+  for (const f of files.filter((x) => x.text).sort((a, b) => a.text!.length - b.text!.length)) {
+    candidates.push({ kind: 'file', label: f.path, text: f.text!, maxChars: MAX_FILE_CHARS });
+  }
+
+  // (d) callers of the changed symbols in files outside the diff, nearest directories first
+  const symbols = extractSymbols(opts.rawDiff);
+  if (symbols.length) {
+    const inDiff = new Set(changed.map((f) => f.path));
+    const nearness = (p: string) => Math.max(0, ...changed.map((f) => sharedPrefix(p, f.path)));
+    const scan = (await source.list())
+      .filter((p) => CODE_EXT.test(p) && !inDiff.has(p) && !p.split('/').includes('node_modules'))
+      .sort((a, b) => nearness(b) - nearness(a))
+      .slice(0, source.scanLimit);
+    const texts = await mapLimit(scan, 8, async (path) => ({ path, text: (await source.read(path)) ?? '' }));
+    const hits = findCallers(symbols, texts);
+    if (hits.length) {
+      candidates.push({
+        kind: 'callers',
+        label: symbols.join(', '),
+        text: hits.map((h) => `${h.path}:${h.line}  [${h.symbol}]  ${h.text}`).join('\n'),
+        maxChars: 4_000,
+      });
+    }
+  }
+
+  return assembleContext(candidates, budget);
 }

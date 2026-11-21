@@ -21,12 +21,21 @@ export function buildLineIndex(diff: UnifiedDiff): Map<string, Set<number>> {
 }
 
 export function groundFindings(findings: Finding[], diff: UnifiedDiff): { kept: Finding[]; dropped: Dropped[] } {
-  // TODO(step 1): make `npm test` green.
-  //   1. const index = buildLineIndex(diff)
-  //   2. file not in index            → dropped, reason: `file '<path>' is not in the diff`
-  //   3. no line in [lo..hi] in index  → dropped, reason: `lines <lo>-<hi> do not touch any hunk in '<path>'`
-  //      (lo/hi = min/max of start_line and end_line: models sometimes swap them)
-  //   4. otherwise                     → kept
-  void diff;
-  return { kept: findings, dropped: [] };
+  const index = buildLineIndex(diff);
+  const kept: Finding[] = [];
+  const dropped: Dropped[] = [];
+  for (const finding of findings) {
+    const lines = index.get(finding.file);
+    if (!lines) {
+      dropped.push({ finding, reason: `file '${finding.file}' is not in the diff` });
+      continue;
+    }
+    const lo = Math.min(finding.start_line, finding.end_line);
+    const hi = Math.max(finding.start_line, finding.end_line);
+    let touches = false;
+    for (let n = lo; n <= hi && !touches; n++) touches = lines.has(n);
+    if (touches) kept.push(finding);
+    else dropped.push({ finding, reason: `lines ${lo}-${hi} do not touch any hunk in '${finding.file}'` });
+  }
+  return { kept, dropped };
 }
