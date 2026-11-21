@@ -41,11 +41,19 @@ function sameProblem(a: Finding, b: Finding): boolean {
 }
 
 export function dedupFindings(perAgent: { agent: string; findings: Finding[] }[]): MergedFinding[] {
-  // TODO(step 4): merge findings that are the same problem (see sameProblem above):
-  //   - walk the agents in order; compare each finding with the merged list so far
-  //   - a match adds the agent to `agents` (no duplicates in that list)
-  //   - the merged finding keeps the text and severity of the MOST severe report (RANK)
-  //   - result sorted: severity high → low, then file, then start_line
-  // For now every finding stays separate.
-  return perAgent.flatMap(({ agent, findings }) => findings.map((f) => ({ ...f, agents: [agent] })));
+  const merged: MergedFinding[] = [];
+  for (const { agent, findings } of perAgent) {
+    for (const finding of findings) {
+      const i = merged.findIndex((m) => sameProblem(m, finding));
+      if (i === -1) {
+        merged.push({ ...finding, agents: [agent] });
+        continue;
+      }
+      const agents = merged[i].agents.includes(agent) ? merged[i].agents : [...merged[i].agents, agent];
+      merged[i] = RANK[finding.severity] > RANK[merged[i].severity] ? { ...finding, agents } : { ...merged[i], agents };
+    }
+  }
+  return merged.sort(
+    (a, b) => RANK[b.severity] - RANK[a.severity] || a.file.localeCompare(b.file) || a.start_line - b.start_line,
+  );
 }
